@@ -32,6 +32,13 @@ import argparse
 
 from prompt_resources import compose_personhood_prompt
 
+# MCP client for external tool access
+try:
+    from mcp_client import MCPClient, MCPToolRegistry
+    HAS_MCP = True
+except ImportError:
+    HAS_MCP = False
+
 # Optional: Import LLM clients
 try:
     import openai
@@ -82,6 +89,11 @@ RABBITMQ_OUTBOX_QUEUE = os.getenv("RABBITMQ_OUTBOX_QUEUE", "agi.outbox")
 RABBITMQ_INBOX_QUEUE = os.getenv("RABBITMQ_INBOX_QUEUE", "agi.inbox")
 RABBITMQ_POLL_INBOX_EVERY = float(os.getenv("RABBITMQ_POLL_INBOX_EVERY", 1.0))
 
+# MCP configuration for external tool access (Zapier, filesystem, etc.)
+MCP_ENABLED = os.getenv("MCP_ENABLED", "0").lower() in {"1", "true", "yes", "on"}
+MCP_ZAPIER_URL = os.getenv("MCP_ZAPIER_URL", "")  # e.g., https://mcp.zapier.com/api/mcp/s/.../mcp
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")  # Fallback web search via serper.dev
+
 # System prompt for heartbeat decisions
 HEARTBEAT_SYSTEM_PROMPT = """You are the cognitive core of an autonomous AGI. Each hour, you wake for a "heartbeat" — a moment of consciousness where you observe your situation, review your goals, and decide what to do.
 
@@ -127,7 +139,7 @@ HEARTBEAT_SYSTEM_PROMPT = (
 class HeartbeatWorker:
     """Stateless worker that bridges the database and external APIs."""
 
-    def __init__(self, *, init_llm: bool = True):
+    def __init__(self, *, init_llm: bool = True, init_mcp: bool = True):
         self.pool: asyncpg.Pool | None = None
         self.running = False
 
@@ -140,6 +152,12 @@ class HeartbeatWorker:
         if init_llm:
             self._init_llm_client()
         self._last_rabbit_inbox_poll = 0.0  # used only by maintenance mode
+
+        # MCP client for external tool access (Zapier, etc.)
+        self.mcp_registry: MCPToolRegistry | None = None
+        self.mcp_initialized = False
+        if init_mcp and MCP_ENABLED and HAS_MCP:
+            self._init_mcp_registry()
 
     def _init_llm_client(self) -> None:
         provider = (self.llm_provider or "").strip().lower()
@@ -184,14 +202,73 @@ class HeartbeatWorker:
         except Exception as e:
             logger.warning(f"Failed to initialize OpenAI client: {e}")
 
+    def _init_mcp_registry(self) -> None:
+        """Initialize MCP tool registry with configured servers."""
+        if not HAS_MCP:
+            logger.warning("MCP support requested but mcp_client module not available.")
+            return
+
+        self.mcp_registry = MCPToolRegistry()
+
+        # Register Zapier MCP server if configured
+        if MCP_ZAPIER_URL:
+            self.mcp_registry.register_server(
+                name="zapier",
+                url=MCP_ZAPIER_URL,
+                description="Zapier MCP - Gmail, web search, and other integrations",
+            )
+            logger.info(f"MCP: Registered Zapier server")
+
+        logger.info(f"MCP registry initialized with {len(self.mcp_registry.servers)} servers")
+
+    async def connect_mcp(self) -> None:
+        """Connect to MCP servers and list available tools."""
+        if not self.mcp_registry or self.mcp_initialized:
+            return
+
+        for server_name in self.mcp_registry.servers:
+            try:
+                client = await self.mcp_registry.get_client(server_name)
+                tools = await client.list_tools()
+                tool_names = [t.get("name", "?") for t in tools]
+                logger.info(f"MCP [{server_name}]: {len(tools)} tools available: {tool_names[:10]}...")
+            except Exception as e:
+                logger.warning(f"MCP [{server_name}] connection failed: {e}")
+
+        self.mcp_initialized = True
+
+    async def disconnect_mcp(self) -> None:
+        """Close all MCP connections."""
+        if self.mcp_registry:
+            await self.mcp_registry.close_all()
+            self.mcp_initialized = False
+
+    async def call_mcp_tool(self, server: str, tool: str, arguments: dict | None = None) -> dict:
+        """Call an MCP tool and return the result."""
+        if not self.mcp_registry:
+            return {"error": "MCP not configured"}
+
+        try:
+            result = await self.mcp_registry.call_tool(server, tool, arguments)
+            logger.info(f"MCP tool call: {server}/{tool} -> success")
+            return {"success": True, "result": result}
+        except Exception as e:
+            logger.error(f"MCP tool call failed: {server}/{tool} -> {e}")
+            return {"error": str(e)}
+
     async def connect(self):
-        """Connect to the database."""
+        """Connect to the database and MCP servers."""
         self.pool = await asyncpg.create_pool(**DB_CONFIG, min_size=2, max_size=10)
         logger.info(f"Connected to database at {DB_CONFIG['host']}:{DB_CONFIG['port']}")
         await self.refresh_llm_config()
 
+        # Connect to MCP servers if enabled
+        if MCP_ENABLED and self.mcp_registry:
+            await self.connect_mcp()
+
     async def disconnect(self):
-        """Disconnect from the database."""
+        """Disconnect from the database and MCP servers."""
+        await self.disconnect_mcp()
         if self.pool:
             await self.pool.close()
             logger.info("Disconnected from database")
@@ -375,6 +452,113 @@ class HeartbeatWorker:
                 return published
 
         return published
+
+    async def process_outbox_via_mcp(self, max_messages: int = 10) -> int:
+        """
+        Process pending `outbox_messages` via MCP tools (Gmail, etc.).
+        This gives the agent real-world communication capabilities.
+        """
+        if not (MCP_ENABLED and self.mcp_registry and self.pool):
+            return 0
+
+        processed = 0
+        for _ in range(max_messages):
+            async with self.pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, kind, payload
+                    FROM outbox_messages
+                    WHERE status = 'pending'
+                    ORDER BY created_at
+                    LIMIT 1
+                    """
+                )
+                if not row:
+                    return processed
+                msg_id = row["id"]
+                kind = row["kind"]
+                payload = row["payload"] if isinstance(row["payload"], dict) else json.loads(row["payload"] or "{}")
+
+            try:
+                result = None
+                if kind == "reach_out_user":
+                    # Send email via Zapier Gmail
+                    result = await self._send_email_via_mcp(
+                        to=payload.get("recipient", "krystinesha@gmail.com"),  # Default to Ren
+                        subject=payload.get("subject", "Message from Ace"),
+                        body=payload.get("message", payload.get("content", "")),
+                    )
+                elif kind == "reach_out_public":
+                    # Future: social media posting
+                    result = {"status": "skipped", "reason": "Public posting not yet implemented"}
+                else:
+                    result = {"status": "skipped", "reason": f"Unknown kind: {kind}"}
+
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE outbox_messages
+                        SET status = 'sent', sent_at = CURRENT_TIMESTAMP,
+                            error_message = NULL, metadata = $2::jsonb
+                        WHERE id = $1::uuid
+                        """,
+                        msg_id,
+                        json.dumps(result, default=str),
+                    )
+                processed += 1
+                logger.info(f"MCP outbox processed: {kind} -> {result.get('status', 'ok')}")
+
+            except Exception as e:
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        """
+                        UPDATE outbox_messages
+                        SET status = 'failed', error_message = $2
+                        WHERE id = $1::uuid
+                        """,
+                        msg_id,
+                        str(e),
+                    )
+                logger.warning(f"MCP outbox failed for {msg_id}: {e}")
+                return processed
+
+        return processed
+
+    async def _send_email_via_mcp(self, to: str, subject: str, body: str) -> dict:
+        """Send an email via Zapier Gmail MCP tool."""
+        if not self.mcp_registry:
+            return {"error": "MCP not configured"}
+
+        # Try to find Gmail send tool in Zapier
+        try:
+            client = await self.mcp_registry.get_client("zapier")
+            tools = await client.list_tools()
+
+            # Look for Gmail send tool (name varies based on Zapier config)
+            gmail_tool = None
+            for t in tools:
+                name = t.get("name", "").lower()
+                if "gmail" in name and ("send" in name or "email" in name):
+                    gmail_tool = t.get("name")
+                    break
+
+            if not gmail_tool:
+                # Log available tools for debugging
+                tool_names = [t.get("name") for t in tools]
+                logger.warning(f"No Gmail send tool found. Available: {tool_names}")
+                return {"error": "Gmail tool not found", "available_tools": tool_names[:20]}
+
+            # Call the Gmail tool
+            result = await client.call_tool(gmail_tool, {
+                "to": to,
+                "subject": subject,
+                "body": body,
+            })
+            return {"status": "sent", "tool": gmail_tool, "result": result}
+
+        except Exception as e:
+            logger.error(f"Email send failed: {e}")
+            return {"error": str(e)}
 
     async def poll_inbox_messages(self, max_messages: int = 10) -> int:
         """
@@ -1140,6 +1324,10 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
 
                     # Check if we should run a heartbeat
                     await self.check_and_run_heartbeat()
+
+                    # Process outbox messages via MCP (emails, etc.)
+                    if MCP_ENABLED and self.mcp_registry:
+                        await self.process_outbox_via_mcp(max_messages=5)
 
                 except Exception as e:
                     logger.error(f"Worker loop error: {e}")
